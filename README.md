@@ -5,15 +5,17 @@ This module is a wrapper for rabbitmq/amqp091-go package
 ## Installation
 
 ```bash
-go get -u github.com/astreter/amqpwrapper/v2
+go get -u github.com/Insly/amqpwrapper/v2
 ```
 
 ## Publishing messages to a queue example
 
 ```go
+package somepackage
+
 import (
     "context"
-    "github.com/astreter/amqpwrapper/v2"
+    "github.com/Insly/amqpwrapper/v2"
     "sync"
 )
 
@@ -53,9 +55,11 @@ func main() {
 ## Receiving messages from a queue example
 
 ```go
+package somepackage
+
 import (
     "context"
-    "github.com/astreter/amqpwrapper/v2"
+    "github.com/Insly/amqpwrapper/v2"
     "sync"
 )
 
