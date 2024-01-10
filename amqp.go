@@ -3,7 +3,7 @@ package amqpwrapper
 import (
 	"context"
 	"encoding/json"
-	"github.com/astreter/amqpwrapper/v2/otelamqp"
+	"github.com/Insly/amqpwrapper/v2/otelamqp"
 	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/sirupsen/logrus"
@@ -14,12 +14,16 @@ import (
 	"time"
 )
 
+type ctxKey string
+
 const (
 	connectionTries     = 3
 	resendTries         = 3
 	heartbeatTimeout    = 60 * time.Second
 	defaultLocale       = "en_US"
 	defaultThreadsCount = 3
+
+	rabbitCtxKey ctxKey = "rabbitMQ channel ctx"
 )
 
 type RabbitChannel struct {
@@ -73,7 +77,7 @@ type Header struct {
 	Value string
 }
 
-type option struct {
+type Option struct {
 	Name  string
 	Value interface{}
 }
@@ -96,7 +100,7 @@ func NewRabbitChannel(parentCtx context.Context, wg *sync.WaitGroup, cfg *Config
 		logrus.Debug("RabbitMQ.URL: ", url)
 	}
 
-	ch.ctx = context.WithValue(parentCtx, "rabbitMQ channel ctx", nil)
+	ch.ctx = context.WithValue(parentCtx, rabbitCtxKey, nil)
 	ch.cancel = make(chan bool)
 	ch.waitGroup = wg
 	ch.consumers = make(map[string]consumer)
@@ -210,113 +214,126 @@ func (ch *RabbitChannel) Publish(
 
 	tries := resendTries
 	for {
-		if tries == 0 {
-			err = errors.New("RabbitMQ: too many attempts to publish a message")
-			span.RecordError(err)
-			logrus.Error(err)
-			return err
-		}
-		if ch.reconnecting {
-			ch.reconnectMutex.RLock()
-			ch.reconnectMutex.RUnlock()
-		}
-		span.AddEvent("send message to RabbitMQ")
-		err = ch.channel.Publish(
-			exchangeName, // exchange
-			routingKey,   // routing key
-			false,        // mandatory
-			false,        // immediate
-			msg,
-		)
+		flagContinue, err := func() (bool, error) {
+			if tries == 0 {
+				err = errors.New("RabbitMQ: too many attempts to publish a message")
+				span.RecordError(err)
+				logrus.Error(err)
+				return false, err
+			}
+			if ch.reconnecting {
+				ch.reconnectMutex.RLock()
+				defer ch.reconnectMutex.RUnlock()
+			}
+			span.AddEvent("send message to RabbitMQ")
+			err = ch.channel.PublishWithContext(
+				ctx,
+				exchangeName, // exchange
+				routingKey,   // routing key
+				false,        // mandatory
+				false,        // immediate
+				msg,
+			)
+
+			if err != nil {
+				if err == amqp.ErrClosed && tries != 0 {
+					time.Sleep(time.Millisecond * 300)
+					tries -= 1
+					return true, nil
+				}
+				err = errors.Wrap(err, "RabbitMQ: failed to publish a message")
+				span.RecordError(err)
+				logrus.Error(err)
+				return false, err
+			}
+			if ch.confirmSendsMode {
+				span.AddEvent("waiting for confirmation", trace.WithAttributes(attribute.String("queue", routingKey)))
+				logrus.WithField("queue", routingKey).Debug("waiting for confirmation")
+				select {
+				case confirm := <-ch.notifyConfirm:
+					if !confirm.Ack {
+						err = errors.New("rabbitMQ: failed to publish a message: delivery is not acknowledged")
+						span.RecordError(err)
+						logrus.Error(err)
+						return false, err
+					} else {
+						note := "message successfully published"
+						span.AddEvent(note, trace.WithAttributes(
+							attribute.String("queue", routingKey),
+							attribute.Int("delivery tag", int(confirm.DeliveryTag)),
+						))
+						logrus.WithField("queue", routingKey).WithField("delivery tag", confirm.DeliveryTag).Debug(note)
+						return false, nil
+					}
+				case <-time.After(3 * time.Second):
+					if tries == 0 {
+						err = errors.New("rabbitMQ: failed to publish a message: delivery confirmation is not received")
+						span.RecordError(err)
+						logrus.Error(err)
+						return false, err
+					}
+					tries -= 1
+				}
+			} else {
+				return false, nil
+			}
+
+			return true, nil
+		}()
 
 		if err != nil {
-			if err == amqp.ErrClosed && tries != 0 {
-				time.Sleep(time.Millisecond * 300)
-				tries -= 1
-				continue
-			}
-			err = errors.Wrap(err, "RabbitMQ: failed to publish a message")
-			span.RecordError(err)
-			logrus.Error(err)
 			return err
-		}
-		if ch.confirmSendsMode {
-			span.AddEvent("waiting for confirmation", trace.WithAttributes(attribute.String("queue", routingKey)))
-			logrus.WithField("queue", routingKey).Debug("waiting for confirmation")
-			select {
-			case confirm := <-ch.notifyConfirm:
-				if !confirm.Ack {
-					err = errors.New("rabbitMQ: failed to publish a message: delivery is not acknowledged")
-					span.RecordError(err)
-					logrus.Error(err)
-					return err
-				} else {
-					note := "message successfully published"
-					span.AddEvent(note, trace.WithAttributes(
-						attribute.String("queue", routingKey),
-						attribute.Int("delivery tag", int(confirm.DeliveryTag)),
-					))
-					logrus.WithField("queue", routingKey).WithField("delivery tag", confirm.DeliveryTag).Debug(note)
-					return nil
-				}
-			case <-time.After(3 * time.Second):
-				if tries == 0 {
-					err = errors.New("rabbitMQ: failed to publish a message: delivery confirmation is not received")
-					span.RecordError(err)
-					logrus.Error(err)
-					return err
-				}
-				tries -= 1
-			}
+		} else if flagContinue {
+			continue
 		} else {
 			return nil
 		}
 	}
 }
 
-func WithOptionDurable(flag bool) option {
-	return option{
+func WithOptionDurable(flag bool) Option {
+	return Option{
 		Name:  "durable",
 		Value: flag,
 	}
 }
 
-func WithOptionThreads(number int) option {
-	return option{
+func WithOptionThreads(number int) Option {
+	return Option{
 		Name:  "threads",
 		Value: number,
 	}
 }
 
-func WithOptionAutoDelete(flag bool) option {
-	return option{
+func WithOptionAutoDelete(flag bool) Option {
+	return Option{
 		Name:  "auto-delete",
 		Value: flag,
 	}
 }
 
-func WithOptionExclusive(flag bool) option {
-	return option{
+func WithOptionExclusive(flag bool) Option {
+	return Option{
 		Name:  "exclusive",
 		Value: flag,
 	}
 }
 
-func WithOptionNoWait(flag bool) option {
-	return option{
+func WithOptionNoWait(flag bool) Option {
+	return Option{
 		Name:  "no-wait",
 		Value: flag,
 	}
 }
 
-func WithOptionAutoAck(flag bool) option {
-	return option{
+func WithOptionAutoAck(flag bool) Option {
+	return Option{
 		Name:  "auto-ack",
 		Value: flag,
 	}
 }
 
-func defineConsumerOptions(opts []option) map[string]interface{} {
+func defineConsumerOptions(opts []Option) map[string]interface{} {
 	var options = map[string]interface{}{
 		"durable":     true,
 		"auto-delete": false,
@@ -333,7 +350,7 @@ func defineConsumerOptions(opts []option) map[string]interface{} {
 	return options
 }
 
-func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback MessageListener, opts ...option) error {
+func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback MessageListener, opts ...Option) error {
 	options := defineConsumerOptions(opts)
 	q, err := ch.channel.QueueDeclare(
 		routingKey,                    // name
@@ -432,7 +449,7 @@ func (ch *RabbitChannel) connect() error {
 			if tries == connectionTries {
 				return errors.Wrap(err, "failed to connect to RabbitMQ")
 			} else {
-				time.Sleep(time.Second)
+				time.Sleep(1 * time.Second)
 			}
 		} else {
 			ch.conn = conn
@@ -497,32 +514,39 @@ func (ch *RabbitChannel) startNotifyCancelOrClosed() {
 
 func (ch *RabbitChannel) reconnect() {
 	for {
-		select {
-		case errorConnection, ok := <-ch.errorConnection:
-			if !ch.closed && ok && errorConnection != nil {
-				if ch.reconnecting {
-					continue
-				}
+		errorConnection, ok := <-ch.errorConnection
+		if !ch.closed && ok && errorConnection != nil {
+			if ch.reconnecting {
+				continue
+			}
+			err := func() error {
 				ch.reconnectMutex.Lock()
+				defer ch.reconnectMutex.Unlock()
+
 				ch.reconnecting = true
 				logrus.Error(errors.Wrap(errorConnection, "RabbitMQ: service tries to reconnect"))
 				if err := ch.connect(); err != nil {
 					logrus.Error(err.Error())
 					ch.cancel <- true
-					return
+					return err
 				}
 
 				err := ch.recoverConsumers()
 				if err != nil {
 					ch.cancel <- true
-					return
+					return err
 				}
 				ch.reconnecting = false
-				ch.reconnectMutex.Unlock()
-			} else {
-				ch.cancel <- true
+
+				return nil
+			}()
+
+			if err != nil {
 				return
 			}
+		} else {
+			ch.cancel <- true
+			return
 		}
 	}
 }

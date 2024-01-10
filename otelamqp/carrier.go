@@ -30,7 +30,7 @@ func (c PublisherMessageCarrier) Set(key, val string) {
 // Keys returns a slice of all key identifiers in the carrier.
 func (c PublisherMessageCarrier) Keys() []string {
 	out := make([]string, len(c.msg.Headers))
-	for key, _ := range c.msg.Headers {
+	for key := range c.msg.Headers {
 		out = append(out, key)
 	}
 	return out
@@ -62,7 +62,7 @@ func (c ConsumerMessageCarrier) Set(key, val string) {
 // Keys returns a slice of all key identifiers in the carrier.
 func (c ConsumerMessageCarrier) Keys() []string {
 	out := make([]string, len(c.delivery.Headers))
-	for key, _ := range c.delivery.Headers {
+	for key := range c.delivery.Headers {
 		out = append(out, key)
 	}
 	return out
