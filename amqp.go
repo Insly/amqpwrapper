@@ -32,7 +32,8 @@ type RabbitChannel struct {
 	cancel           chan bool
 	waitGroup        *sync.WaitGroup
 	conn             *amqp.Connection
-	channel          *amqp.Channel
+	publishChannel   *amqp.Channel
+	consumeChannel   *amqp.Channel
 	url              string
 	errorConnection  chan error
 	notifyConfirm    chan amqp.Confirmation
@@ -95,7 +96,11 @@ func NewRabbitChannel(parentCtx context.Context, wg *sync.WaitGroup, cfg *Config
 		logrus.Info("RabbitMQ.URL not found, building from components")
 		url = "amqp://" + cfg.User + ":" + cfg.Password + "@" + cfg.Host + ":" + cfg.Port
 		if cfg.Vhost != "" {
-			url = url + cfg.Vhost
+			if cfg.Vhost[0] != '/' {
+				url = url + "/" + cfg.Vhost
+			} else {
+				url = url + cfg.Vhost
+			}
 		}
 		logrus.Debug("RabbitMQ.URL: ", url)
 	}
@@ -138,7 +143,7 @@ func (ch *RabbitChannel) SetTracer(trace trace.Tracer) {
 func (ch *RabbitChannel) DefineExchange(exchangeName string, isAlreadyExist bool) error {
 	var err error
 	if isAlreadyExist {
-		err = ch.channel.ExchangeDeclarePassive(
+		err = ch.consumeChannel.ExchangeDeclarePassive(
 			exchangeName, // name
 			"topic",      // type
 			true,         // durable
@@ -148,7 +153,7 @@ func (ch *RabbitChannel) DefineExchange(exchangeName string, isAlreadyExist bool
 			nil,          // arguments
 		)
 	} else {
-		err = ch.channel.ExchangeDeclare(
+		err = ch.consumeChannel.ExchangeDeclare(
 			exchangeName, // name
 			"topic",      // type
 			true,         // durable
@@ -192,7 +197,7 @@ func (ch *RabbitChannel) Publish(
 		attribute.String("message body", string(body)),
 	)
 
-	if ch.closed {
+	if ch.conn.IsClosed() {
 		err = errors.New("rabbitMQ: failed to publish a message: connection is lost")
 		span.RecordError(err)
 		return err
@@ -221,12 +226,20 @@ func (ch *RabbitChannel) Publish(
 				logrus.Error(err)
 				return false, err
 			}
-			if ch.reconnecting {
-				ch.reconnectMutex.RLock()
-				defer ch.reconnectMutex.RUnlock()
+			if ch.reconnecting || ch.publishChannel == nil || ch.publishChannel.IsClosed() {
+				if tries > 0 {
+					time.Sleep(300 * time.Millisecond)
+					tries -= 1
+					return true, nil
+				} else {
+					err = errors.Wrap(err, "RabbitMQ: failed to publish a message, publish channel is closed or reconnecting")
+					span.RecordError(err)
+					logrus.Error(err)
+					return false, err
+				}
 			}
 			span.AddEvent("send message to RabbitMQ")
-			err = ch.channel.PublishWithContext(
+			err = ch.publishChannel.PublishWithContext(
 				ctx,
 				exchangeName, // exchange
 				routingKey,   // routing key
@@ -234,10 +247,9 @@ func (ch *RabbitChannel) Publish(
 				false,        // immediate
 				msg,
 			)
-
 			if err != nil {
 				if err == amqp.ErrClosed && tries != 0 {
-					time.Sleep(time.Millisecond * 300)
+					time.Sleep(300 * time.Millisecond)
 					tries -= 1
 					return true, nil
 				}
@@ -352,7 +364,7 @@ func defineConsumerOptions(opts []Option) map[string]interface{} {
 
 func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback MessageListener, opts ...Option) error {
 	options := defineConsumerOptions(opts)
-	q, err := ch.channel.QueueDeclare(
+	q, err := ch.consumeChannel.QueueDeclare(
 		routingKey,                    // name
 		options["durable"].(bool),     // durable
 		options["auto-delete"].(bool), // delete when unused
@@ -366,7 +378,7 @@ func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback
 		return err
 	}
 
-	err = ch.channel.QueueBind(
+	err = ch.consumeChannel.QueueBind(
 		q.Name,       // queue name
 		routingKey,   // routing key
 		exchangeName, // exchange
@@ -379,7 +391,7 @@ func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback
 		return err
 	}
 
-	msgChannel, err := ch.channel.Consume(
+	msgChannel, err := ch.consumeChannel.Consume(
 		q.Name,                      // queue
 		"",                          // consumer
 		options["auto-ack"].(bool),  // auto ack
@@ -422,24 +434,47 @@ func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback
 	return nil
 }
 
-func (ch *RabbitChannel) Close() {
-	if ch.IsAlive() {
-		logrus.Debug("Shutting down RabbitMQ client...")
-		ch.closed = true
-		_ = ch.channel.Close()
-		err := ch.conn.Close()
-		if err != nil {
-			logrus.Error(errors.Wrap(err, "RabbitMQ: failed to close the connection"))
-		}
-		logrus.Info("RabbitMQ: Connection is closed")
-	}
-}
+func (ch *RabbitChannel) Close() error {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	var closeErrs []error
 
-func (ch *RabbitChannel) IsAlive() bool {
-	return !ch.conn.IsClosed()
+	logrus.Debug("Shutting down RabbitMQ client...")
+
+	// Close the publishing channel if it's open
+	if ch.publishChannel != nil && !ch.publishChannel.IsClosed() {
+		if err := ch.publishChannel.Close(); err != nil {
+			closeErrs = append(closeErrs, errors.Wrap(err, "RabbitMQ: failed to close publish channel"))
+		}
+	}
+
+	// Close the consuming channel if it's open
+	if ch.consumeChannel != nil && !ch.consumeChannel.IsClosed() {
+		if err := ch.consumeChannel.Close(); err != nil {
+			closeErrs = append(closeErrs, errors.Wrap(err, "RabbitMQ: failed to close consume channel"))
+		}
+	}
+
+	// Close the connection if it's open
+	if ch.conn != nil && !ch.conn.IsClosed() {
+		if err := ch.conn.Close(); err != nil {
+			closeErrs = append(closeErrs, errors.Wrap(err, "RabbitMQ: failed to close connection"))
+		}
+	}
+
+	// Return any errors that occurred during closure
+	if len(closeErrs) > 0 {
+		return errors.Errorf("multiple errors occurred while closing resources: %v", closeErrs)
+	}
+
+	logrus.Info("RabbitMQ: Connection is closed")
+	return nil
 }
 
 func (ch *RabbitChannel) connect() error {
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+
 	var err error
 	tries := 0
 	for tries < connectionTries {
@@ -458,21 +493,26 @@ func (ch *RabbitChannel) connect() error {
 		}
 	}
 
-	ch.channel, err = ch.conn.Channel()
+	ch.publishChannel, err = ch.conn.Channel()
 	if err != nil {
-		return errors.Wrap(err, "RabbitMQ: failed to open a channel")
+		return errors.Wrap(err, "RabbitMQ: failed to open a publishing channel")
+	}
+
+	ch.consumeChannel, err = ch.conn.Channel()
+	if err != nil {
+		return errors.Wrap(err, "RabbitMQ: failed to open a consuming channel")
 	}
 
 	if ch.confirmSendsMode {
-		err = ch.channel.Confirm(false)
+		err = ch.publishChannel.Confirm(false)
 		if err != nil {
 			return err
 		}
 
 		ch.notifyConfirm = make(chan amqp.Confirmation)
-		ch.channel.NotifyPublish(ch.notifyConfirm)
+		ch.publishChannel.NotifyPublish(ch.notifyConfirm)
 	}
-	err = ch.channel.Qos(0, 0, true)
+	err = ch.consumeChannel.Qos(0, 0, true)
 	if err != nil {
 		return errors.Wrap(err, "RabbitMQ: failed to set QoS of a channel")
 	}
@@ -485,45 +525,59 @@ func (ch *RabbitChannel) connect() error {
 
 // listens on the channel's cancelled and closed
 func (ch *RabbitChannel) startNotifyCancelOrClosed() {
-	notifyCloseConn := make(chan *amqp.Error)
-	notifyCloseConn = ch.conn.NotifyClose(notifyCloseConn)
-	notifyBlockConn := make(chan amqp.Blocking)
-	notifyBlockConn = ch.conn.NotifyBlocked(notifyBlockConn)
-	notifyCloseChan := make(chan *amqp.Error)
-	notifyCloseChan = ch.channel.NotifyClose(notifyCloseChan)
-	notifyCancelChan := make(chan string)
-	notifyCancelChan = ch.channel.NotifyCancel(notifyCancelChan)
-	select {
-	case err := <-notifyCloseConn:
-		logrus.Info("attempting to reconnect to amqp server after connection close")
-		ch.errorConnection <- err
-	case block := <-notifyBlockConn:
-		logrus.Errorf("Server hits a memory or disk alarm: %s", block.Reason)
-		ch.cancel <- true
-	case err := <-notifyCloseChan:
-		// If the connection close is triggered by the Server, a reconnection takes place
-		if err != nil && err.Server {
-			logrus.Info("attempting to reconnect to amqp server after channel close")
+	notifyCloseConn := ch.conn.NotifyClose(make(chan *amqp.Error))
+	notifyBlockConn := ch.conn.NotifyBlocked(make(chan amqp.Blocking))
+	notifyClosePubChan := ch.publishChannel.NotifyClose(make(chan *amqp.Error))
+	notifyCancelPubChan := ch.publishChannel.NotifyCancel(make(chan string))
+	notifyCloseConsChan := ch.consumeChannel.NotifyClose(make(chan *amqp.Error))
+	notifyCancelConsChan := ch.consumeChannel.NotifyCancel(make(chan string))
+
+	for {
+		select {
+		case err := <-notifyCloseConn:
+			logrus.Info("attempting to reconnect to amqp server after connection close")
 			ch.errorConnection <- err
+			return
+		case block := <-notifyBlockConn:
+			logrus.Errorf("Server hits a memory or disk alarm: %s", block.Reason)
+			ch.cancel <- true
+		case err := <-notifyClosePubChan:
+			if err != nil && err.Server {
+				logrus.Info("attempting to reconnect to amqp server after publish channel close")
+				ch.errorConnection <- err
+			}
+			return
+		case err := <-notifyCancelPubChan:
+			logrus.Info("attempting to reconnect to amqp server after publish channel cancel")
+			ch.errorConnection <- errors.New(err)
+			return
+		case err := <-notifyCloseConsChan:
+			if err != nil && err.Server {
+				logrus.Info("attempting to reconnect to amqp server after consume channel close")
+				ch.errorConnection <- err
+			}
+			return
+		case err := <-notifyCancelConsChan:
+			logrus.Info("attempting to reconnect to amqp server after consume channel cancel")
+			ch.errorConnection <- errors.New(err)
+			return
 		}
-	case err := <-notifyCancelChan:
-		logrus.Info("attempting to reconnect to amqp server after cancel")
-		ch.errorConnection <- errors.New(err)
 	}
 }
 
 func (ch *RabbitChannel) reconnect() {
 	for {
 		errorConnection, ok := <-ch.errorConnection
-		if !ch.closed && ok && errorConnection != nil {
+		if !ch.conn.IsClosed() && ok && errorConnection != nil {
+			ch.reconnectMutex.Lock()
 			if ch.reconnecting {
+				ch.reconnectMutex.Unlock()
 				continue
 			}
-			err := func() error {
-				ch.reconnectMutex.Lock()
-				defer ch.reconnectMutex.Unlock()
+			ch.reconnecting = true
+			ch.reconnectMutex.Unlock()
 
-				ch.reconnecting = true
+			err := func() error {
 				logrus.Error(errors.Wrap(errorConnection, "RabbitMQ: service tries to reconnect"))
 				if err := ch.connect(); err != nil {
 					logrus.Error(err.Error())
@@ -531,12 +585,14 @@ func (ch *RabbitChannel) reconnect() {
 					return err
 				}
 
-				err := ch.recoverConsumers()
-				if err != nil {
+				if err := ch.recoverConsumers(); err != nil {
 					ch.cancel <- true
 					return err
 				}
+
+				ch.reconnectMutex.Lock()
 				ch.reconnecting = false
+				ch.reconnectMutex.Unlock()
 
 				return nil
 			}()
@@ -552,8 +608,10 @@ func (ch *RabbitChannel) reconnect() {
 }
 
 func (ch *RabbitChannel) recoverConsumers() error {
-	for routingKey, consumer := range ch.consumers {
-		err := ch.SetUpConsumer(consumer.exchangeName, routingKey, consumer.callback)
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+	for routingKey, cons := range ch.consumers {
+		err := ch.SetUpConsumer(cons.exchangeName, routingKey, cons.callback)
 		if err != nil {
 			return err
 		}
@@ -586,7 +644,7 @@ func (ch *RabbitChannel) listenQueue(
 			go ch.processDelivery(delivery, ok, routingKey, version, callback, availableThreads)
 		case <-ctx.Done():
 			logrus.Debugf("listener %s.v%d is going down", routingKey, version)
-			if err := ch.channel.Cancel(routingKey, false); err != nil {
+			if err := ch.consumeChannel.Cancel(routingKey, false); err != nil {
 				logrus.Errorf("cancel of %s.v%d failed: %q", routingKey, version, err)
 			}
 
@@ -620,7 +678,7 @@ func (ch *RabbitChannel) processDelivery(
 		version = ch.consumers[routingKey].version
 		ch.mu.RUnlock()
 
-		if d, ok, err := ch.channel.Get(routingKey, false); err != nil {
+		if d, ok, err := ch.consumeChannel.Get(routingKey, false); err != nil {
 			logrus.Errorf("queue %s.v%d: %q", routingKey, version, err)
 			ch.cancel <- true
 		} else if ok {
