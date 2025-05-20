@@ -17,13 +17,18 @@ func NewPublisherMessageCarrier(msg *amqp.Publishing) PublisherMessageCarrier {
 // Get retrieves a single value for a given key.
 func (c PublisherMessageCarrier) Get(key string) string {
 	if val, exists := c.msg.Headers[key]; exists {
-		return val.(string)
+		if strVal, ok := val.(string); ok {
+			return strVal
+		}
 	}
 	return ""
 }
 
 // Set sets a header.
 func (c PublisherMessageCarrier) Set(key, val string) {
+	if c.msg.Headers == nil {
+		c.msg.Headers = amqp.Table{}
+	}
 	c.msg.Headers[key] = val
 }
 
@@ -49,13 +54,18 @@ func NewConsumerMessageCarrier(delivery *amqp.Delivery) ConsumerMessageCarrier {
 // Get retrieves a single value for a given key.
 func (c ConsumerMessageCarrier) Get(key string) string {
 	if val, exists := c.delivery.Headers[key]; exists {
-		return val.(string)
+		if strVal, ok := val.(string); ok {
+			return strVal
+		}
 	}
 	return ""
 }
 
 // Set sets a header.
 func (c ConsumerMessageCarrier) Set(key, val string) {
+	if c.delivery.Headers == nil {
+		c.delivery.Headers = amqp.Table{}
+	}
 	c.delivery.Headers[key] = val
 }
 

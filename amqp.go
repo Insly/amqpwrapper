@@ -646,7 +646,15 @@ func (ch *RabbitChannel) processDelivery(
 		attribute.String("queue", routingKey),
 		attribute.String("delivery payload", string(delivery.Body)),
 	)
-	defer span.End()
+
+	defer func() {
+		if r := recover(); r != nil {
+			logrus.Errorf("panic in span.End(): %v", r)
+		}
+		if span != nil && span.SpanContext().IsValid() {
+			span.End()
+		}
+	}()
 
 	logrus.WithField("queue", routingKey).WithField("version", version).Debug("delivery received")
 	if err := callback(ctx, delivery); err != nil {
