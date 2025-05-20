@@ -53,12 +53,38 @@ type MessageListener func(ctx context.Context, delivery amqp.Delivery) error
 type ErrRequeue struct {
 	error
 }
+type semaphore struct {
+	ch chan struct{}
+}
+
+func newSemaphore(size int) *semaphore {
+	return &semaphore{
+		ch: make(chan struct{}, size),
+	}
+}
+
+func (s *semaphore) Acquire(ctx context.Context) bool {
+	select {
+	case s.ch <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *semaphore) Release() {
+	select {
+	case <-s.ch:
+	default:
+		// Nothing to release or already empty
+	}
+}
 
 type consumer struct {
-	exchangeName     string
-	callback         MessageListener
-	version          int
-	availableThreads chan bool
+	exchangeName string
+	callback     MessageListener
+	version      int
+	threads      *semaphore
 }
 
 type Config struct {
@@ -410,19 +436,15 @@ func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback
 	}
 
 	ch.consumers[routingKey] = consumer{
-		exchangeName:     exchangeName,
-		callback:         callback,
-		version:          version,
-		availableThreads: make(chan bool, options["threads"].(int)),
-	}
-
-	for len(ch.consumers[routingKey].availableThreads) < options["threads"].(int) {
-		ch.consumers[routingKey].availableThreads <- true
+		exchangeName: exchangeName,
+		callback:     callback,
+		version:      version,
+		threads:      newSemaphore(options["threads"].(int)),
 	}
 
 	logrus.Debugf("consumer %s is created", routingKey)
 
-	go ch.listenQueue(routingKey, version, msgChannel, callback, ch.consumers[routingKey].availableThreads)
+	go ch.listenQueue(routingKey, version, msgChannel, callback, ch.consumers[routingKey].threads)
 
 	return nil
 }
@@ -587,7 +609,7 @@ func (ch *RabbitChannel) listenQueue(
 	version int,
 	msgChannel <-chan amqp.Delivery,
 	callback MessageListener,
-	availableThreads chan bool,
+	threads *semaphore,
 ) {
 	type key string
 
@@ -601,10 +623,11 @@ func (ch *RabbitChannel) listenQueue(
 	for {
 		select {
 		case delivery, ok := <-msgChannel:
-			if _, open := <-availableThreads; !open {
+			if !threads.Acquire(ch.ctx) {
+				logrus.Debugf("listener %s.v%d: semaphore acquire failed or context canceled", routingKey, version)
 				return
 			}
-			go ch.processDelivery(delivery, ok, routingKey, version, callback, availableThreads)
+			go ch.processDelivery(delivery, ok, routingKey, version, callback, threads)
 		case <-ctx.Done():
 			logrus.Debugf("listener %s.v%d is going down", routingKey, version)
 			if err := ch.channel.Cancel(routingKey, false); err != nil {
@@ -622,18 +645,14 @@ func (ch *RabbitChannel) processDelivery(
 	routingKey string,
 	version int,
 	callback MessageListener,
-	availableThreads chan bool,
+	threads *semaphore,
 ) {
 	defer func() {
 		if r := recover(); r != nil {
 			logrus.Errorf("panic in processDelivery: %v\n%s", r, debug.Stack())
 			ch.cancelFunc()
 		}
-		select {
-		case availableThreads <- true:
-		default:
-			logrus.Warn("availableThreads channel full or closed")
-		}
+		threads.Release()
 	}()
 
 	if !ok {
@@ -642,9 +661,12 @@ func (ch *RabbitChannel) processDelivery(
 		ch.reconnectMutex.RLock()
 		defer ch.reconnectMutex.RUnlock()
 
+		// Lock only for reading shared state
 		ch.mu.RLock()
-		version = ch.consumers[routingKey].version
-		defer ch.mu.RUnlock()
+		if c, ok := ch.consumers[routingKey]; ok {
+			version = c.version
+		}
+		ch.mu.RUnlock()
 
 		if ch.channel == nil {
 			logrus.Errorf("channel is nil while trying to Get from queue %s.v%d", routingKey, version)
