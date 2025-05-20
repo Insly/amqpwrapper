@@ -3,6 +3,7 @@ package amqpwrapper
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/Insly/amqpwrapper/v2/otelamqp"
 	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -10,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -29,7 +31,7 @@ const (
 type RabbitChannel struct {
 	ctx              context.Context
 	mu               sync.RWMutex
-	cancel           chan bool
+	cancelFunc       context.CancelFunc
 	waitGroup        *sync.WaitGroup
 	conn             *amqp.Connection
 	channel          *amqp.Channel
@@ -100,8 +102,11 @@ func NewRabbitChannel(parentCtx context.Context, wg *sync.WaitGroup, cfg *Config
 		logrus.Debug("RabbitMQ.URL: ", url)
 	}
 
-	ch.ctx = context.WithValue(parentCtx, rabbitCtxKey, nil)
-	ch.cancel = make(chan bool)
+	ctx := context.WithValue(parentCtx, rabbitCtxKey, nil)
+	ctx, cancel := context.WithCancel(ctx)
+	ch.ctx = ctx
+	ch.cancelFunc = cancel
+
 	ch.waitGroup = wg
 	ch.consumers = make(map[string]consumer)
 	ch.reconnecting = false
@@ -426,7 +431,9 @@ func (ch *RabbitChannel) Close() {
 	if ch.IsAlive() {
 		logrus.Debug("Shutting down RabbitMQ client...")
 		ch.closed = true
-		_ = ch.channel.Close()
+		if err := ch.channel.Close(); err != nil {
+			logrus.Error(errors.Wrap(err, "RabbitMQ: failed to close the channel"))
+		}
 		err := ch.conn.Close()
 		if err != nil {
 			logrus.Error(errors.Wrap(err, "RabbitMQ: failed to close the connection"))
@@ -441,6 +448,17 @@ func (ch *RabbitChannel) IsAlive() bool {
 
 func (ch *RabbitChannel) connect() error {
 	var err error
+	// Close old channel and connection if they exist
+	if ch.channel != nil {
+		if err := ch.channel.Close(); err != nil {
+			logrus.Warn(errors.Wrap(err, "RabbitMQ: failed to close previous channel"))
+		}
+	}
+	if ch.conn != nil && ch.IsAlive() {
+		if err := ch.conn.Close(); err != nil {
+			logrus.Warn(errors.Wrap(err, "RabbitMQ: failed to close previous connection"))
+		}
+	}
 	tries := 0
 	for tries < connectionTries {
 		tries++
@@ -499,7 +517,7 @@ func (ch *RabbitChannel) startNotifyCancelOrClosed() {
 		ch.errorConnection <- err
 	case block := <-notifyBlockConn:
 		logrus.Errorf("Server hits a memory or disk alarm: %s", block.Reason)
-		ch.cancel <- true
+		ch.cancelFunc()
 	case err := <-notifyCloseChan:
 		// If the connection close is triggered by the Server, a reconnection takes place
 		if err != nil && err.Server {
@@ -527,13 +545,13 @@ func (ch *RabbitChannel) reconnect() {
 				logrus.Error(errors.Wrap(errorConnection, "RabbitMQ: service tries to reconnect"))
 				if err := ch.connect(); err != nil {
 					logrus.Error(err.Error())
-					ch.cancel <- true
+					ch.cancelFunc()
 					return err
 				}
 
 				err := ch.recoverConsumers()
 				if err != nil {
-					ch.cancel <- true
+					ch.cancelFunc()
 					return err
 				}
 				ch.reconnecting = false
@@ -542,10 +560,13 @@ func (ch *RabbitChannel) reconnect() {
 			}()
 
 			if err != nil {
-				return
+				logrus.Errorf("Reconnect failed: %v. Retrying in 5s...", err)
+				time.Sleep(5 * time.Second)
+				ch.reconnecting = false
+				continue
 			}
 		} else {
-			ch.cancel <- true
+			ch.cancelFunc()
 			return
 		}
 	}
@@ -595,11 +616,6 @@ func (ch *RabbitChannel) listenQueue(
 	}
 }
 
-// Cancel signals that connection to RabbitMQ is broken
-func (ch *RabbitChannel) Cancel() <-chan bool {
-	return ch.cancel
-}
-
 func (ch *RabbitChannel) processDelivery(
 	delivery amqp.Delivery,
 	ok bool,
@@ -609,25 +625,42 @@ func (ch *RabbitChannel) processDelivery(
 	availableThreads chan bool,
 ) {
 	defer func() {
-		availableThreads <- true
+		if r := recover(); r != nil {
+			logrus.Errorf("panic in processDelivery: %v\n%s", r, debug.Stack())
+			ch.cancelFunc()
+		}
+		select {
+		case availableThreads <- true:
+		default:
+			logrus.Warn("availableThreads channel full or closed")
+		}
 	}()
+
 	if !ok {
 		logrus.Debugf("channel for %s.v%d seems to be closed", routingKey, version)
+
 		ch.reconnectMutex.RLock()
 		defer ch.reconnectMutex.RUnlock()
 
 		ch.mu.RLock()
 		version = ch.consumers[routingKey].version
-		ch.mu.RUnlock()
+		defer ch.mu.RUnlock()
 
-		if d, ok, err := ch.channel.Get(routingKey, false); err != nil {
+		if ch.channel == nil {
+			logrus.Errorf("channel is nil while trying to Get from queue %s.v%d", routingKey, version)
+			return
+		}
+
+		d, ok, err := ch.channel.Get(routingKey, false)
+		if err != nil {
 			logrus.Errorf("queue %s.v%d: %q", routingKey, version, err)
-			ch.cancel <- true
-		} else if ok {
+			ch.cancelFunc()
+			return
+		}
+		if ok {
 			if err := d.Nack(false, true); err != nil {
 				logrus.Error("looks like we have lost a delivery")
-				close(availableThreads)
-				ch.cancel <- true
+				ch.cancelFunc()
 			}
 		}
 
@@ -657,21 +690,23 @@ func (ch *RabbitChannel) processDelivery(
 	}()
 
 	logrus.WithField("queue", routingKey).WithField("version", version).Debug("delivery received")
+
 	if err := callback(ctx, delivery); err != nil {
 		span.RecordError(err)
 		logrus.Error(err)
+
 		_, requeue := err.(ErrRequeue)
 		span.AddEvent("negatively acknowledge the delivery", trace.WithAttributes(attribute.String("queue", routingKey)))
+
 		if err := delivery.Nack(false, requeue); err != nil {
-			err = errors.Wrap(err, "RabbitMQ: message nacking failed. Consumer is turned off")
+			err = fmt.Errorf("RabbitMQ: message nacking failed. Consumer is turned off: %w", err)
 			span.RecordError(err)
 			logrus.WithField("queue", routingKey).Error(err)
-			close(availableThreads)
-			ch.cancel <- true
+			ch.cancelFunc()
 		}
 	} else {
 		if err := delivery.Ack(false); err != nil {
-			err = errors.Wrapf(err, "%s.v%d: acknowledger failed with an error", routingKey, version)
+			err = fmt.Errorf("%s.v%d: acknowledger failed with an error: %w", routingKey, version, err)
 			span.RecordError(err)
 			logrus.Error(err)
 		}
