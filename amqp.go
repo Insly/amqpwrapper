@@ -19,11 +19,12 @@ import (
 type ctxKey string
 
 const (
-	connectionTries     = 3
-	resendTries         = 3
-	heartbeatTimeout    = 60 * time.Second
-	defaultLocale       = "en_US"
-	defaultThreadsCount = 3
+	connectionTries      = 3
+	resendTries          = 3
+	heartbeatTimeout     = 60 * time.Second
+	defaultLocale        = "en_US"
+	defaultThreadsCount  = 3
+	maxReconnectAttempts = 10
 
 	rabbitCtxKey ctxKey = "rabbitMQ channel ctx"
 )
@@ -553,40 +554,51 @@ func (ch *RabbitChannel) startNotifyCancelOrClosed() {
 }
 
 func (ch *RabbitChannel) reconnect() {
+	attempts := 0
 	for {
 		errorConnection, ok := <-ch.errorConnection
 		if !ch.closed && ok && errorConnection != nil {
 			if ch.reconnecting {
 				continue
 			}
+
+			if attempts >= maxReconnectAttempts {
+				logrus.Errorf("Max reconnect attempts reached (%d). Giving up.", maxReconnectAttempts)
+				ch.cancelFunc()
+				return
+			}
+
+			attempts++
+
 			err := func() error {
 				ch.reconnectMutex.Lock()
 				defer ch.reconnectMutex.Unlock()
-
 				ch.reconnecting = true
+				defer func() { ch.reconnecting = false }()
+
 				logrus.Error(errors.Wrap(errorConnection, "RabbitMQ: service tries to reconnect"))
+
 				if err := ch.connect(); err != nil {
 					logrus.Error(err.Error())
 					ch.cancelFunc()
 					return err
 				}
 
-				err := ch.recoverConsumers()
-				if err != nil {
+				if err := ch.recoverConsumers(); err != nil {
 					ch.cancelFunc()
 					return err
 				}
-				ch.reconnecting = false
 
 				return nil
 			}()
 
 			if err != nil {
-				logrus.Errorf("Reconnect failed: %v. Retrying in 5s...", err)
-				time.Sleep(5 * time.Second)
-				ch.reconnecting = false
+				logrus.Errorf("Reconnect failed: %v. Retrying in 1s...", err)
+				time.Sleep(1 * time.Second)
 				continue
 			}
+
+			attempts = 0
 		} else {
 			ch.cancelFunc()
 			return
@@ -602,6 +614,15 @@ func (ch *RabbitChannel) recoverConsumers() error {
 		}
 	}
 	return nil
+}
+
+// Cancel signals that connection to RabbitMQ is broken
+func (ch *RabbitChannel) Cancel() context.CancelFunc {
+	return ch.cancelFunc
+}
+
+func (ch *RabbitChannel) Done() <-chan struct{} {
+	return ch.ctx.Done()
 }
 
 func (ch *RabbitChannel) listenQueue(
