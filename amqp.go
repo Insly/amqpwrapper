@@ -565,6 +565,8 @@ func (ch *RabbitChannel) reconnect() {
 			if attempts >= maxReconnectAttempts {
 				logrus.Errorf("Max reconnect attempts reached (%d). Giving up.", maxReconnectAttempts)
 				ch.cancelFunc()
+				ch.waitGroup.Wait() // wait for all consumers to exit
+				_ = ch.channel.Close()
 				return
 			}
 
@@ -586,6 +588,8 @@ func (ch *RabbitChannel) reconnect() {
 
 				if err := ch.recoverConsumers(); err != nil {
 					ch.cancelFunc()
+					ch.waitGroup.Wait() // wait for all consumers to exit
+					_ = ch.channel.Close()
 					return err
 				}
 
@@ -601,6 +605,8 @@ func (ch *RabbitChannel) reconnect() {
 			attempts = 0
 		} else {
 			ch.cancelFunc()
+			ch.waitGroup.Wait() // wait for all consumers to exit
+			_ = ch.channel.Close()
 			return
 		}
 	}
@@ -646,6 +652,10 @@ func (ch *RabbitChannel) listenQueue(
 		case delivery, ok := <-msgChannel:
 			if !threads.Acquire(ch.ctx) {
 				logrus.Debugf("listener %s.v%d: semaphore acquire failed or context canceled", routingKey, version)
+				return
+			}
+			if ch.channel == nil || ch.conn.IsClosed() {
+				logrus.Warn("Skipping ack/nack: channel is closed")
 				return
 			}
 			go ch.processDelivery(delivery, ok, routingKey, version, callback, threads)
@@ -742,7 +752,7 @@ func (ch *RabbitChannel) processDelivery(
 		span.AddEvent("negatively acknowledge the delivery", trace.WithAttributes(attribute.String("queue", routingKey)))
 
 		if err := delivery.Nack(false, requeue); err != nil {
-			err = fmt.Errorf("RabbitMQ: message nacking failed. Consumer is turned off: %w", err)
+			err = fmt.Errorf("RabbitMQ: message nacking failed for queue %s.v%d: %w", routingKey, version, err)
 			span.RecordError(err)
 			logrus.WithField("queue", routingKey).Error(err)
 			ch.cancelFunc()
