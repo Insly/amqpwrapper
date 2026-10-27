@@ -2,8 +2,14 @@ package amqpwrapper
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"runtime/debug"
+	"sync"
+	"time"
+
 	"github.com/Insly/amqpwrapper/v2/otelamqp"
 	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -11,9 +17,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"runtime/debug"
-	"sync"
-	"time"
 )
 
 type ctxKey string
@@ -84,6 +87,7 @@ func (s *semaphore) Release() {
 type consumer struct {
 	exchangeName string
 	callback     MessageListener
+	options      []Option // to set up the consumer the same way on reconnect
 	version      int
 	threads      *semaphore
 }
@@ -118,15 +122,15 @@ func NewRabbitChannel(parentCtx context.Context, wg *sync.WaitGroup, cfg *Config
 		logrus.SetLevel(logrus.DebugLevel)
 	}
 
-	url := cfg.URL
-	logrus.Debug("RabbitMQ.URL: ", url)
-	if url == "" {
+	uri := cfg.URL
+	logrus.Debug("RabbitMQ.URL: ", redactURL(uri))
+	if uri == "" {
 		logrus.Info("RabbitMQ.URL not found, building from components")
-		url = "amqp://" + cfg.User + ":" + cfg.Password + "@" + cfg.Host + ":" + cfg.Port
+		uri = "amqp://" + cfg.User + ":" + cfg.Password + "@" + cfg.Host + ":" + cfg.Port
 		if cfg.Vhost != "" {
-			url = url + cfg.Vhost
+			uri = uri + cfg.Vhost
 		}
-		logrus.Debug("RabbitMQ.URL: ", url)
+		logrus.Debug("RabbitMQ.URL: ", redactURL(uri))
 	}
 
 	ctx := context.WithValue(parentCtx, rabbitCtxKey, nil)
@@ -137,7 +141,7 @@ func NewRabbitChannel(parentCtx context.Context, wg *sync.WaitGroup, cfg *Config
 	ch.waitGroup = wg
 	ch.consumers = make(map[string]consumer)
 	ch.reconnecting = false
-	ch.url = url
+	ch.url = uri
 	ch.errorConnection = make(chan error)
 	ch.confirmSendsMode = cfg.ConfirmSends
 	ch.tracer = otel.Tracer("amqpwrapper")
@@ -161,6 +165,15 @@ func NewRabbitChannel(parentCtx context.Context, wg *sync.WaitGroup, cfg *Config
 	go ch.reconnect()
 
 	return ch, nil
+}
+
+// redactURL hides the password of a connection URL, so it's safe to log.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparsable URL>"
+	}
+	return u.Redacted()
 }
 
 func (ch *RabbitChannel) SetTracer(trace trace.Tracer) {
@@ -240,7 +253,10 @@ func (ch *RabbitChannel) Publish(
 		Headers:     headersTable,
 		ContentType: "application/json",
 		Body:        body,
+		// The server keeps it on redeliveries, so consumers can recognize the message they have already handled
+		MessageId: rand.Text(),
 	}
+	span.SetAttributes(attribute.String("message id", msg.MessageId))
 
 	otel.GetTextMapPropagator().Inject(ctx, otelamqp.NewPublisherMessageCarrier(&msg))
 
@@ -439,6 +455,7 @@ func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback
 	ch.consumers[routingKey] = consumer{
 		exchangeName: exchangeName,
 		callback:     callback,
+		options:      opts,
 		version:      version,
 		threads:      newSemaphore(options["threads"].(int)),
 	}
@@ -542,10 +559,16 @@ func (ch *RabbitChannel) startNotifyCancelOrClosed() {
 		logrus.Errorf("Server hits a memory or disk alarm: %s", block.Reason)
 		ch.cancelFunc()
 	case err := <-notifyCloseChan:
-		// If the connection close is triggered by the Server, a reconnection takes place
-		if err != nil && err.Server {
+		// Listeners stop when their delivery channel is closed, so the close must never be ignored.
+		// Any error leads to a reconnection, including the ones not triggered by the Server, e.g. a network
+		// failure when the connection is lost before this goroutine started to wait, so both close
+		// notifications are pending. A close without an error which is not made by Close() cancels the channel.
+		if err != nil {
 			logrus.Info("attempting to reconnect to amqp server after channel close")
 			ch.errorConnection <- err
+		} else if !ch.closed {
+			logrus.Error("RabbitMQ: channel is closed unexpectedly")
+			ch.cancelFunc()
 		}
 	case err := <-notifyCancelChan:
 		logrus.Info("attempting to reconnect to amqp server after cancel")
@@ -614,7 +637,7 @@ func (ch *RabbitChannel) reconnect() {
 
 func (ch *RabbitChannel) recoverConsumers() error {
 	for routingKey, consumer := range ch.consumers {
-		err := ch.SetUpConsumer(consumer.exchangeName, routingKey, consumer.callback)
+		err := ch.SetUpConsumer(consumer.exchangeName, routingKey, consumer.callback, consumer.options...)
 		if err != nil {
 			return err
 		}
@@ -650,6 +673,12 @@ func (ch *RabbitChannel) listenQueue(
 	for {
 		select {
 		case delivery, ok := <-msgChannel:
+			if !ok {
+				// The channel or connection is closed. reconnect() starts a new version of the listener,
+				// or cancels the channel when it fails.
+				logrus.Debugf("listener %s.v%d: delivery channel is closed", routingKey, version)
+				return
+			}
 			if !threads.Acquire(ch.ctx) {
 				logrus.Debugf("listener %s.v%d: semaphore acquire failed or context canceled", routingKey, version)
 				return
@@ -658,7 +687,7 @@ func (ch *RabbitChannel) listenQueue(
 				logrus.Warn("Skipping ack/nack: channel is closed")
 				return
 			}
-			go ch.processDelivery(delivery, ok, routingKey, version, callback, threads)
+			go ch.processDelivery(delivery, routingKey, version, callback, threads)
 		case <-ctx.Done():
 			logrus.Debugf("listener %s.v%d is going down", routingKey, version)
 			if err := ch.channel.Cancel(routingKey, false); err != nil {
@@ -672,7 +701,6 @@ func (ch *RabbitChannel) listenQueue(
 
 func (ch *RabbitChannel) processDelivery(
 	delivery amqp.Delivery,
-	ok bool,
 	routingKey string,
 	version int,
 	callback MessageListener,
@@ -686,41 +714,6 @@ func (ch *RabbitChannel) processDelivery(
 		threads.Release()
 	}()
 
-	if !ok {
-		logrus.Debugf("channel for %s.v%d seems to be closed", routingKey, version)
-
-		ch.reconnectMutex.RLock()
-		defer ch.reconnectMutex.RUnlock()
-
-		// Lock only for reading shared state
-		ch.mu.RLock()
-		if c, ok := ch.consumers[routingKey]; ok {
-			version = c.version
-		}
-		ch.mu.RUnlock()
-
-		if ch.channel == nil {
-			logrus.Errorf("channel is nil while trying to Get from queue %s.v%d", routingKey, version)
-			return
-		}
-
-		d, ok, err := ch.channel.Get(routingKey, false)
-		if err != nil {
-			logrus.Errorf("queue %s.v%d: %q", routingKey, version, err)
-			ch.cancelFunc()
-			return
-		}
-		if ok {
-			if err := d.Nack(false, true); err != nil {
-				logrus.Error("looks like we have lost a delivery")
-				ch.cancelFunc()
-			}
-		}
-
-		logrus.Debugf("listener %s.v%d is back on track", routingKey, version)
-		return
-	}
-
 	// Extract a span context from message to link.
 	carrier := otelamqp.NewConsumerMessageCarrier(&delivery)
 	parentSpanContext := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
@@ -731,6 +724,8 @@ func (ch *RabbitChannel) processDelivery(
 		attribute.String("exchange", delivery.Exchange),
 		attribute.String("queue", routingKey),
 		attribute.String("delivery payload", string(delivery.Body)),
+		attribute.String("message id", delivery.MessageId),
+		attribute.Bool("redelivered", delivery.Redelivered),
 	)
 
 	defer func() {
@@ -742,7 +737,9 @@ func (ch *RabbitChannel) processDelivery(
 		}
 	}()
 
-	logrus.WithField("queue", routingKey).WithField("version", version).Debug("delivery received")
+	logrus.WithField("queue", routingKey).WithField("version", version).
+		WithField("message_id", delivery.MessageId).WithField("redelivered", delivery.Redelivered).
+		Debug("delivery received")
 
 	if err := callback(ctx, delivery); err != nil {
 		span.RecordError(err)
@@ -754,14 +751,25 @@ func (ch *RabbitChannel) processDelivery(
 		if err := delivery.Nack(false, requeue); err != nil {
 			err = fmt.Errorf("RabbitMQ: message nacking failed for queue %s.v%d: %w", routingKey, version, err)
 			span.RecordError(err)
-			logrus.WithField("queue", routingKey).Error(err)
-			ch.cancelFunc()
+			if errors.Is(err, amqp.ErrClosed) {
+				// The channel is closed, e.g. by a reconnect, which takes care of the consumers. The server
+				// requeues the unacknowledged delivery itself, so there is no need to cancel the channel.
+				logrus.WithField("queue", routingKey).Warn(err)
+			} else {
+				logrus.WithField("queue", routingKey).Error(err)
+				ch.cancelFunc()
+			}
 		}
 	} else {
 		if err := delivery.Ack(false); err != nil {
 			err = fmt.Errorf("%s.v%d: acknowledger failed with an error: %w", routingKey, version, err)
 			span.RecordError(err)
-			logrus.Error(err)
+			if errors.Is(err, amqp.ErrClosed) {
+				// The channel is closed, e.g. by a reconnect: the server delivers the message again
+				logrus.WithField("queue", routingKey).Warn(err)
+			} else {
+				logrus.Error(err)
+			}
 		}
 		span.AddEvent("the delivery acknowledged")
 	}
